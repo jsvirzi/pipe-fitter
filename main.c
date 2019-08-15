@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 /* threads */
 #include <sched.h>
@@ -27,7 +28,7 @@
 #define TIOCPMACT 0x5443 /* PM is active */
 #endif
 
-uint8_t debug = 0, verbose = 0, n3 = 0;
+int debug = 0, verbose = 0, n3 = 0;
 
 int set_blocking_mode(int fd, int blocking) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -139,6 +140,12 @@ int initialize_serial_port(const char *dev, int baud_rate, int canonical, int pa
     return fd;
 }
 
+typedef struct LooperArgsPreamble {
+    int *arm;
+    int *run;
+    int *thread_run;
+} LooperArgsPreamble;
+
 typedef struct Queue {
     uint8_t *buff;
     unsigned int head, tail, mask;
@@ -151,6 +158,7 @@ typedef struct Pool {
     unsigned int head;
     unsigned int tail;
     unsigned int mask;
+    unsigned int buff_size;
 } Pool;
 
 void initialize_pool(Pool *pool, int buffs, int buff_size) {
@@ -161,6 +169,7 @@ void initialize_pool(Pool *pool, int buffs, int buff_size) {
     for (int i = 0; i < buffs; ++i) {
         pool->buff[i] = (uint8_t *) malloc(buff_size);
     }
+    pool->buff_size = buff_size;
 }
 
 void initialize_queue(Queue *queue, int length) {
@@ -168,8 +177,6 @@ void initialize_queue(Queue *queue, int length) {
     queue->buff = (uint8_t *) malloc(length);
     queue->mask = length - 1;
 }
-//int get_xmit_buffer(Pool *pool, unsigned int id, uint8_t **buff, unsigned int **length);
-//int flush_queue(Queue *q);
 
 int open_uart(const char *dev_name, int baud_rate) {
     int canonical = 0;
@@ -187,13 +194,11 @@ typedef struct ServerArgs {
     int sock_fd;
     int conn_fd;
     int port;
-    int *arm;
-    int *run;
-    int *thread_run;
+    LooperArgsPreamble preamble;
     int state;
+    Pool *rx_pool;
+    Pool *tx_pool;
     struct sockaddr_in cli;
-    Queue *rx_queue;
-    Pool *emit_pool;
 } ServerArgs;
 
 enum {
@@ -205,135 +210,188 @@ enum {
 typedef struct TxLooperArgs {
     pthread_t *tid;
     Pool *pool;
-    unsigned int *run;
+    LooperArgsPreamble preamble;
     int fd;
     unsigned int verbose, debug, format;
 } TxLooperArgs;
 
 void *tx_looper(void *ext) {
     TxLooperArgs *args = (TxLooperArgs *) ext;
+    LooperArgsPreamble *preamble = &args->preamble;
     Pool *pool = args->pool;
-    while (*args->run) {
-        while (pool->head >= pool->tail) {
-            if (pool->length[pool->tail] && args->fd) {
-                int remaining = pool->length[pool->tail];
-                while (remaining > 0) {
-                    int n_bytes = write(args->fd, pool->buff[pool->tail], remaining);
-                    remaining = remaining - n_bytes;
+    while (*preamble->thread_run) {
+        while (*preamble->arm == 0) { usleep(1000); }
+        while (*preamble->run) {
+            while (pool->head >= pool->tail) {
+                if (pool->length[pool->tail] && args->fd) {
+                    int remaining = pool->length[pool->tail];
+                    while (remaining > 0) {
+                        int n_bytes = write(args->fd, pool->buff[pool->tail], remaining);
+                        remaining = remaining - n_bytes;
+                    }
+                    pool->length[pool->tail] = 0; /* clear once done */
+                    pool->tail = (pool->tail + 1) & pool->mask;
+                } else {
+                    usleep(1000); /* micronap */
                 }
-                pool->length[pool->tail] = 0; /* clear once done */
-                pool->tail = (pool->tail + 1) & pool->mask;
-            } else {
-                usleep(1000); /* micronap */
             }
         }
     }
+    return NULL;
 }
 
 typedef struct RxLooperArgs {
     pthread_t *tid;
-    Queue *queue;
-    unsigned int *run;
+    LooperArgsPreamble preamble;
     int fd;
     unsigned int verbose, debug, format;
-    Queue *rx_queue;
-    Pool *emit_pool;
+    Pool *pool;
 } RxLooperArgs;
+
+enum {
+    DISPLAY_FORMAT_ASCII = 0,
+    DISPLAY_FORMAT_HEX,
+    DISPLAY_FORMATS
+};
 
 void *rx_looper(void *ext) {
     RxLooperArgs *args = (RxLooperArgs *) ext;
-    Queue *q = args->queue;
-    while (*args->run) {
-        int fit = 0;
-        if (q->head >= q->tail) {
-            fit = 1 + q->mask - q->head;
-        } else {
-            fit = q->tail - q->head - 1;
-        }
-        if (fit) {
-            int n_read = read(args->fd, &q->buff[q->head], fit);
-            if ((n_read > 0) && args->verbose) {
-                printf("\n");
-                for (int i = 0; i < n_read; ++i) {
-                    uint8_t byte = q->buff[(q->head + i) & q->mask];
-                    if (args->format == FORMAT_ASCII) { printf("%c", byte); }
-                    else if (args->format == FORMAT_HEX) { printf("%2.2x ", byte); }
+    Pool *pool = args->pool;
+    LooperArgsPreamble *preamble = &args->preamble;
+    while (*preamble->thread_run) {
+        while (*preamble->arm == 0) { usleep(1000); }
+        while (*preamble->run) {
+            unsigned int new_head = (pool->head + 1) & pool->mask;
+            if (new_head != pool->tail) {
+                uint8_t *ptr = pool->buff[pool->head];
+                unsigned int n_read = read(args->fd, pool->buff[pool->head], pool->buff_size);
+                pool->length[pool->head] = n_read;
+                if (n_read != pool->buff_size) { pool->buff[pool->head][n_read] = 0; } /* null-terminate */
+                pool->head = new_head;
+                if ((n_read > 0) && args->verbose) {
+                    printf("\n");
+                    for (int i = 0; i < n_read; ++i) {
+                        uint8_t byte = ptr[i];
+                        if (args->format == DISPLAY_FORMAT_ASCII) { printf("%c", byte); }
+                        else if (args->format == DISPLAY_FORMAT_HEX) { printf("%2.2x ", byte); }
+                    }
+                    if (n_read > 0) { printf("\n"); }
                 }
-                if (n_read > 0) { printf("\n"); }
             }
-            q->head = (q->head + n_read) & q->mask;
+            usleep(1000);
         }
-        usleep(1000);
     }
     return NULL;
 }
 
 void *server_loop(void *ext) {
-    ServerArgs *server_args = (ServerArgs *) ext;
-    server_args->state = ServerStateIdle;
-    while (*server_args->thread_run) {
-        while (*server_args->arm == 0) {
-            usleep(1000);
-        }
-        while (*server_args->run) {
-            switch (server_args->state) {
+    ServerArgs *args = (ServerArgs *) ext;
+    LooperArgsPreamble *preamble = &args->preamble;
+    args->state = ServerStateIdle;
+    while (*preamble->thread_run) {
+        while (*preamble->arm == 0) { usleep(1000); }
+        while (*preamble->run) {
+            switch (args->state) {
             case ServerStateIdle:
-                server_args->conn_fd = accept(server_args->sock_fd, &server_args->cli, sizeof(server_args->cli));
-                if (server_args->conn_fd > 0) {
-                    printf("accepted connection on port %d. connection = %d\n", server_args->port, server_args->conn_fd);
-                    server_args->state = ServerStateConnected;
+                args->conn_fd = accept(args->sock_fd, &args->cli, sizeof(args->cli));
+                if (args->conn_fd > 0) {
+                    printf("accepted connection on port %d. connection = %d\n", args->port, args->conn_fd);
+                    args->state = ServerStateConnected;
+                }
+                break;
+            case ServerStateConnected: {
+                /* from socket to device */
+                Pool *pool = args->tx_pool;
+                int n_bytes = read(args->conn_fd, pool->buff[pool->head], pool->buff_size);
+                if (n_bytes > 0) {
+                    pool->length[pool->head] = n_bytes;
+                    pool->head = (pool->head + 1) & pool->mask;
+                }
+
+                /* from device to socket */
+                pool = args->rx_pool;
+                if (pool->head != pool->tail) {
+                    int remaining = pool->length[pool->tail];
+                    while (remaining) {
+                        n_bytes = write(args->conn_fd, pool->buff[pool->tail], remaining);
+                        remaining = remaining - n_bytes;
+                    }
+                    pool->tail = (pool->tail + 1) & pool->mask;
                 }
                 break;
             }
+            }
+            usleep(1000);
         }
     }
+    return NULL;
 }
 
 typedef struct ClientArgs {
     pthread_t *tid;
     int port;
     int sock_fd;
-    int *arm;
-    int *run;
-    int *thread_run;
+    LooperArgsPreamble preamble;
     char ip_addr[128];
+    Pool *rx_pool;
+    Pool *tx_pool;
 } ClientArgs;
 
 void *client_loop(void *ext) {
+    ClientArgs *args = (ClientArgs *) ext;
+    LooperArgsPreamble *preamble = &args->preamble;
+    while (*preamble->thread_run) {
+        while (*preamble->arm == 0) { usleep(1000); }
+        while (*preamble->run) {
+            /* from socket to device */
+            Pool *pool = args->tx_pool;
+            int n_bytes = read(args->sock_fd, pool->buff[pool->head], pool->buff_size);
+            if (n_bytes > 0) {
+                pool->length[pool->head] = n_bytes;
+                pool->head = (pool->head + 1) & pool->mask;
+            }
 
+            /* from device to socket */
+            pool = args->rx_pool;
+            if (pool->head != pool->tail) {
+                int remaining = pool->length[pool->tail];
+                while (remaining) {
+                    n_bytes = write(args->sock_fd, pool->buff[pool->tail], remaining);
+                    remaining = remaining - n_bytes;
+                }
+                pool->tail = (pool->tail + 1) & pool->mask;
+            }
+            usleep(1000);
+        }
+    }
+    return NULL;
 }
 
 int open_socket(int server_mode, const char *ip_addr, int port) {
-    if (server_mode) {
     struct sockaddr_in servaddr;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd == -1) { return 0; }
     printf("socket %d successfully created\n", fd);
     bzero(&servaddr, sizeof (servaddr));
     servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
     servaddr.sin_port = htons(port);
-    if ((bind(fd, (struct sockaddr *) &servaddr, sizeof(servaddr))) != 0) {
-        printf("socket failed to bind\n");
-        return 0;
-    }
-    printf("socket bind success\n");
-    set_blocking_mode(fd, 0);
-    const int backlog = 5;
-    if ((listen(fd, backlog)) != 0) {
-        printf("server listen failed\n");
-        return 0;
-    }
+    if (server_mode) {
+        servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if ((bind(fd, (struct sockaddr *) &servaddr, sizeof(servaddr))) != 0) {
+            printf("socket failed to bind\n");
+            return 0;
+        }
+        printf("socket bind success\n");
+        set_blocking_mode(fd, 0);
+        const int backlog = 5;
+        if ((listen(fd, backlog)) != 0) {
+            printf("server listen failed\n");
+            return 0;
+        }
     } else {
-        struct sockaddr_in servaddr;
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd == -1) { return 0; }
-        printf("socket %d successfully created\n", fd);
-        bzero(&servaddr, sizeof (servaddr));
-        servaddr.sin_family = AF_INET;
         servaddr.sin_addr.s_addr = inet_addr(ip_addr);
-        servaddr.sin_port = htons(port);
     }
+    return fd;
 }
 
 int main(int argc, char **argv)
@@ -344,17 +402,14 @@ int main(int argc, char **argv)
     Pool tx_pool, rx_pool;
     initialize_pool(&tx_pool, PoolSize, QueueSize);
     initialize_pool(&rx_pool, PoolSize, QueueSize);
-    Queue tx_queue, rx_queue;
-    initialize_queue(&tx_queue, QueueSize);
-    initialize_queue(&rx_queue, QueueSize);
-
     pthread_t socket_thread, device_rx_thread, device_tx_thread;
+    int thread_run = 1, arm = 0, run = 0;
     int server_mode = 0;
-    int fd_i = 0, fd_o = 0, sock_fd;
     ServerArgs *server_args = NULL;
     ClientArgs *client_args = NULL;
     RxLooperArgs *rx_looper_args = NULL;
     TxLooperArgs *tx_looper_args = NULL;
+    LooperArgsPreamble *preamble;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "-debug") == 0) {
             debug = 1;
@@ -363,55 +418,74 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-n3") == 0) {
             n3 = 1;
         } else if (strcmp(argv[i], "-console") == 0) {
-            fd_i = stdin;
-            fd_o = stdout;
             rx_looper_args = (RxLooperArgs *) malloc(sizeof(RxLooperArgs));
             bzero(rx_looper_args, sizeof(RxLooperArgs));
             rx_looper_args->fd = stdin;
-            rx_looper_args->rx_queue = &rx_queue;
-            rx_looper_args->emit_pool = &rx_pool;
+            rx_looper_args->pool = &rx_pool;
+            preamble = &rx_looper_args->preamble;
+            preamble->run = &run;
+            preamble->arm = &arm;
+            preamble->thread_run = &thread_run;
             tx_looper_args = (TxLooperArgs *) malloc(sizeof(TxLooperArgs));
-            tx_looper_args->fd = stdout;
-            tx_looper_args->
             bzero(tx_looper_args, sizeof(TxLooperArgs));
+            tx_looper_args->fd = stdout;
+            tx_looper_args->pool = &tx_pool;
+            preamble = &tx_looper_args->preamble;
+            preamble->run = &run;
+            preamble->arm = &arm;
+            preamble->thread_run = &thread_run;
             pthread_create(&device_rx_thread, NULL, rx_looper, rx_looper_args);
             pthread_create(&device_tx_thread, NULL, tx_looper, tx_looper_args);
         } else if (strcmp(argv[i], "-uart") == 0) {
             const char *device_name = argv[++i];
             int baud_rate = atoi(argv[++i]);
-            fd_o = fd_i = open_uart(device_name, baud_rate);
             rx_looper_args = (RxLooperArgs *) malloc(sizeof(RxLooperArgs));
+            bzero(rx_looper_args, sizeof(RxLooperArgs));
             tx_looper_args = (TxLooperArgs *) malloc(sizeof(TxLooperArgs));
+            bzero(tx_looper_args, sizeof(TxLooperArgs));
+            rx_looper_args->pool = &rx_pool;
+            tx_looper_args->pool = &tx_pool;
+            rx_looper_args->fd = tx_looper_args->fd = open_uart(device_name, baud_rate);
+            pthread_create(&device_rx_thread, NULL, rx_looper, rx_looper_args);
+            pthread_create(&device_tx_thread, NULL, tx_looper, tx_looper_args);
         } else if (strcmp(argv[i], "-server") == 0) {
             server_args = (ServerArgs *) malloc(sizeof(ServerArgs));
+            bzero(server_args, sizeof(ServerArgs));
+            server_args->tid = &socket_thread;
             server_args->port = atoi(argv[++i]);
-            sock_fd = open_socket(1, NULL, server_args->port);
+            server_args->sock_fd = open_socket(1, NULL, server_args->port);
+            preamble = &server_args->preamble;
+            preamble->arm = &arm; /* make 0 to loop until armed. then set arm = 1 to drop into main loop */
+            preamble->run = &run; /* run = 1 for main loop operation */
+            preamble->thread_run = &thread_run; /* make 0 to quit */
+            int err = pthread_create(server_args->tid, NULL, server_loop, (void *) server_args);
         } else if (strcmp(argv[i], "-client") == 0) {
             client_args = (ClientArgs *) malloc(sizeof(ClientArgs));
+            bzero(client_args, sizeof(ClientArgs));
             snprintf(client_args->ip_addr, sizeof(client_args->ip_addr), argv[++i]);
+            client_args->tid = &socket_thread;
             client_args->port = atoi(argv[++i]);
-            sock_fd = open_socket(0, client_args->ip_addr, client_args->port);
+            client_args->sock_fd = open_socket(0, client_args->ip_addr, client_args->port);
+            preamble = &client_args->preamble;
+            preamble->arm = &arm;
+            preamble->run = &run;
+            preamble->thread_run = &thread_run;
+            client_args->rx_pool = &rx_pool;
+            client_args->tx_pool = &tx_pool;
+            int err = pthread_create(client_args->tid, NULL, client_loop, (void *) client_args);
         }
     }
 
-    int thread_run = 1, arm = 0, run = 0;
-    if (server_mode) {
-        ServerArgs server_args;
-        bzero(&server_args, sizeof(server_args));
-        server_args.tid = &socket_thread;
-        server_args.arm = &arm; /* make 0 to loop until armed. then set arm = 1 to drop into main loop */
-        server_args.run = &run; /* run = 1 for main loop operation */
-        server_args.thread_run = &thread_run; /* make 0 to quit */
-        server_args.sock_fd = sock_fd;
-        socket_thread = pthread_create(&socket_thread, NULL, server_loop, (void *) &server_args);
-    } else {
-        ClientArgs client_args;
-        bzero(&client_args, sizeof(client_args));
-        client_args.tid = &socket_thread;
-        client_args.arm = &arm;
-        client_args.run = &run;
-        client_args.thread_run = &thread_run;
+    while (run) {
+        usleep(1000);
     }
+    thread_run = 0;
+    run = 0;
+    sleep(3); /* wait for threads to die */
+    pthread_join(device_rx_thread, NULL);
+    pthread_join(device_tx_thread, NULL);
+    pthread_join(socket_thread, NULL);
+    printf("good-byte\n");
 
     return 0;
 }
