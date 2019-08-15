@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <errno.h>
 
 /* threads */
 #include <sched.h>
@@ -13,6 +14,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <arpa/inet.h>
 
 /* serial communications */
 #include <termios.h>
@@ -264,18 +266,22 @@ void *rx_looper(void *ext) {
             unsigned int new_head = (pool->head + 1) & pool->mask;
             if (new_head != pool->tail) {
                 uint8_t *ptr = pool->buff[pool->head];
-                unsigned int n_read = read(args->fd, pool->buff[pool->head], pool->buff_size);
-                pool->length[pool->head] = n_read;
-                if (n_read != pool->buff_size) { pool->buff[pool->head][n_read] = 0; } /* null-terminate */
-                pool->head = new_head;
-                if ((n_read > 0) && args->verbose) {
-                    printf("\n");
-                    for (int i = 0; i < n_read; ++i) {
-                        uint8_t byte = ptr[i];
-                        if (args->format == DISPLAY_FORMAT_ASCII) { printf("%c", byte); }
-                        else if (args->format == DISPLAY_FORMAT_HEX) { printf("%2.2x ", byte); }
+                ssize_t n_read = read(args->fd, pool->buff[pool->head], pool->buff_size);
+                if (n_read > 0) {
+                    pool->length[pool->head] = n_read;
+                    if (n_read != pool->buff_size) { pool->buff[pool->head][n_read] = 0; } /* null-terminate */
+                    pool->head = new_head;
+                    if ((n_read > 0) && args->verbose) {
+                        printf("\n");
+                        for (int i = 0; i < n_read; ++i) {
+                            uint8_t byte = ptr[i];
+                            if (args->format == DISPLAY_FORMAT_ASCII) { printf("%c", byte); }
+                            else if (args->format == DISPLAY_FORMAT_HEX) { printf("%2.2x ", byte); }
+                        }
+                        printf("\n");
                     }
-                    if (n_read > 0) { printf("\n"); }
+                } else if (n_read < 0) {
+                    printf("error reading from %d\n", args->fd);
                 }
             }
             usleep(1000);
@@ -292,13 +298,23 @@ void *server_loop(void *ext) {
         while (*preamble->arm == 0) { usleep(1000); }
         while (*preamble->run) {
             switch (args->state) {
-            case ServerStateIdle:
-                args->conn_fd = accept(args->sock_fd, &args->cli, sizeof(args->cli));
+
+            case ServerStateIdle: {
+                int len = sizeof(args->cli);
+                args->conn_fd = accept(args->sock_fd, (struct sockaddr *) &args->cli, &len);
+                // set_blocking_mode(args->conn_fd, 0);
                 if (args->conn_fd > 0) {
                     printf("accepted connection on port %d. connection = %d\n", args->port, args->conn_fd);
                     args->state = ServerStateConnected;
+                } else if (args->conn_fd < 0) {
+                    if (errno != EAGAIN) {
+                        printf("connection %d rejected incoming request on port %d. reason = %d\n", args->sock_fd,
+                               args->port, errno);
+                    }
                 }
                 break;
+            }
+
             case ServerStateConnected: {
                 /* from socket to device */
                 Pool *pool = args->tx_pool;
@@ -335,11 +351,20 @@ typedef struct ClientArgs {
     char ip_addr[128];
     Pool *rx_pool;
     Pool *tx_pool;
+    struct sockaddr_in servaddr;
 } ClientArgs;
 
 void *client_loop(void *ext) {
     ClientArgs *args = (ClientArgs *) ext;
     LooperArgsPreamble *preamble = &args->preamble;
+
+    if (connect(args->sock_fd, (struct sockaddr *) &args->servaddr, sizeof(args->servaddr)) != 0) {
+        printf("boo hoo\n");
+        exit(0);
+    } else {
+        printf("yay\n");
+    }
+
     while (*preamble->thread_run) {
         while (*preamble->arm == 0) { usleep(1000); }
         while (*preamble->run) {
@@ -382,7 +407,6 @@ int open_socket(int server_mode, const char *ip_addr, int port) {
             return 0;
         }
         printf("socket bind success\n");
-        set_blocking_mode(fd, 0);
         const int backlog = 5;
         if ((listen(fd, backlog)) != 0) {
             printf("server listen failed\n");
@@ -403,7 +427,7 @@ int main(int argc, char **argv)
     initialize_pool(&tx_pool, PoolSize, QueueSize);
     initialize_pool(&rx_pool, PoolSize, QueueSize);
     pthread_t socket_thread, device_rx_thread, device_tx_thread;
-    int thread_run = 1, arm = 0, run = 0;
+    int thread_run = 1, arm = 1, run = 1;
     int server_mode = 0;
     ServerArgs *server_args = NULL;
     ClientArgs *client_args = NULL;
@@ -420,7 +444,7 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-console") == 0) {
             rx_looper_args = (RxLooperArgs *) malloc(sizeof(RxLooperArgs));
             bzero(rx_looper_args, sizeof(RxLooperArgs));
-            rx_looper_args->fd = stdin;
+            rx_looper_args->fd = 0;
             rx_looper_args->pool = &rx_pool;
             preamble = &rx_looper_args->preamble;
             preamble->run = &run;
@@ -428,7 +452,7 @@ int main(int argc, char **argv)
             preamble->thread_run = &thread_run;
             tx_looper_args = (TxLooperArgs *) malloc(sizeof(TxLooperArgs));
             bzero(tx_looper_args, sizeof(TxLooperArgs));
-            tx_looper_args->fd = stdout;
+            tx_looper_args->fd = 1;
             tx_looper_args->pool = &tx_pool;
             preamble = &tx_looper_args->preamble;
             preamble->run = &run;
@@ -462,7 +486,7 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-client") == 0) {
             client_args = (ClientArgs *) malloc(sizeof(ClientArgs));
             bzero(client_args, sizeof(ClientArgs));
-            snprintf(client_args->ip_addr, sizeof(client_args->ip_addr), argv[++i]);
+            strcpy(client_args->ip_addr, argv[++i]); /* TODO make safe */
             client_args->tid = &socket_thread;
             client_args->port = atoi(argv[++i]);
             client_args->sock_fd = open_socket(0, client_args->ip_addr, client_args->port);
@@ -476,7 +500,7 @@ int main(int argc, char **argv)
         }
     }
 
-    while (run) {
+    while (thread_run) {
         usleep(1000);
     }
     thread_run = 0;
