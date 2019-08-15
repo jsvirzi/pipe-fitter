@@ -322,10 +322,16 @@ void *server_loop(void *ext) {
             case ServerStateConnected: {
                 /* from socket to device */
                 Pool *pool = args->tx_pool;
+                uint8_t *ptr = pool->buff[pool->head];
                 int n_bytes = read(args->conn_fd, pool->buff[pool->head], pool->buff_size);
                 if (n_bytes > 0) {
                     pool->length[pool->head] = n_bytes;
                     pool->head = (pool->head + 1) & pool->mask;
+                    printf("FOR DEVICE:\n");
+                    int k;
+                    for (k = 0; k < n_bytes; ++k) {
+                        printf("%2.2x ", ptr[k]);
+                    }
                 }
 
                 /* from device to socket */
@@ -376,10 +382,16 @@ void *client_loop(void *ext) {
         while (*preamble->run) {
             /* from socket to device */
             Pool *pool = args->tx_pool;
+            uint8_t *ptr = pool->buff[pool->head];
             int n_bytes = read(args->sock_fd, pool->buff[pool->head], pool->buff_size);
             if (n_bytes > 0) {
                 pool->length[pool->head] = n_bytes;
                 pool->head = (pool->head + 1) & pool->mask;
+                printf("FOR DEVICE:\n");
+                int k;
+                for (k = 0; k < n_bytes; ++k) {
+                    printf("%2.2x ", ptr[k]);
+                }
             }
 
             /* from device to socket */
@@ -476,6 +488,7 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-console") == 0) {
             rx_looper_args = (RxLooperArgs *) malloc(sizeof(RxLooperArgs));
             bzero(rx_looper_args, sizeof(RxLooperArgs));
+            rx_looper_args->tid = &device_rx_thread;
             rx_looper_args->fd = 0;
             rx_looper_args->pool = &rx_pool;
             preamble = &rx_looper_args->preamble;
@@ -484,26 +497,39 @@ int main(int argc, char **argv)
             preamble->thread_run = &thread_run;
             tx_looper_args = (TxLooperArgs *) malloc(sizeof(TxLooperArgs));
             bzero(tx_looper_args, sizeof(TxLooperArgs));
+            tx_looper_args->tid = &device_tx_thread;
             tx_looper_args->fd = 1;
             tx_looper_args->pool = &tx_pool;
             preamble = &tx_looper_args->preamble;
             preamble->run = &run;
             preamble->arm = &arm;
             preamble->thread_run = &thread_run;
-            pthread_create(&device_rx_thread, NULL, rx_looper, rx_looper_args);
-            pthread_create(&device_tx_thread, NULL, tx_looper, tx_looper_args);
+            pthread_create(rx_looper_args->tid, NULL, rx_looper, rx_looper_args);
+            pthread_create(tx_looper_args->tid, NULL, tx_looper, tx_looper_args);
         } else if (strcmp(argv[i], "-uart") == 0) {
             const char *device_name = argv[++i];
             int baud_rate = atoi(argv[++i]);
             rx_looper_args = (RxLooperArgs *) malloc(sizeof(RxLooperArgs));
             bzero(rx_looper_args, sizeof(RxLooperArgs));
+            rx_looper_args->tid = &device_rx_thread;
+            rx_looper_args->pool = &rx_pool;
+            preamble = &rx_looper_args->preamble;
+            preamble->run = &run;
+            preamble->arm = &arm;
+            preamble->thread_run = &thread_run;
             tx_looper_args = (TxLooperArgs *) malloc(sizeof(TxLooperArgs));
             bzero(tx_looper_args, sizeof(TxLooperArgs));
-            rx_looper_args->pool = &rx_pool;
+            tx_looper_args->tid = &device_tx_thread;
             tx_looper_args->pool = &tx_pool;
+            preamble = &tx_looper_args->preamble;
+            preamble->run = &run;
+            preamble->arm = &arm;
+            preamble->thread_run = &thread_run;
             rx_looper_args->fd = tx_looper_args->fd = open_uart(device_name, baud_rate);
-            pthread_create(&device_rx_thread, NULL, rx_looper, rx_looper_args);
-            pthread_create(&device_tx_thread, NULL, tx_looper, tx_looper_args);
+            printf("opened device %d (uart)\n", rx_looper_args->fd);
+            set_blocking_mode(rx_looper_args->fd, 0);
+            pthread_create(rx_looper_args->tid, NULL, rx_looper, rx_looper_args);
+            pthread_create(tx_looper_args->tid, NULL, tx_looper, tx_looper_args);
         } else if (strcmp(argv[i], "-server") == 0) {
             server_args = (ServerArgs *) malloc(sizeof(ServerArgs));
             bzero(server_args, sizeof(ServerArgs));

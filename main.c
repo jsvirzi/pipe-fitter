@@ -322,10 +322,16 @@ void *server_loop(void *ext) {
             case ServerStateConnected: {
                 /* from socket to device */
                 Pool *pool = args->tx_pool;
+                uint8_t *ptr = pool->buff[pool->head];
                 int n_bytes = read(args->conn_fd, pool->buff[pool->head], pool->buff_size);
                 if (n_bytes > 0) {
                     pool->length[pool->head] = n_bytes;
                     pool->head = (pool->head + 1) & pool->mask;
+                    printf("FOR DEVICE:\n");
+                    int k;
+                    for (k = 0; k < n_bytes; ++k) {
+                        printf("%2.2x ", ptr[k]);
+                    }
                 }
 
                 /* from device to socket */
@@ -376,10 +382,16 @@ void *client_loop(void *ext) {
         while (*preamble->run) {
             /* from socket to device */
             Pool *pool = args->tx_pool;
+            uint8_t *ptr = pool->buff[pool->head];
             int n_bytes = read(args->sock_fd, pool->buff[pool->head], pool->buff_size);
             if (n_bytes > 0) {
                 pool->length[pool->head] = n_bytes;
                 pool->head = (pool->head + 1) & pool->mask;
+                printf("FOR DEVICE:\n");
+                int k;
+                for (k = 0; k < n_bytes; ++k) {
+                    printf("%2.2x ", ptr[k]);
+                }
             }
 
             /* from device to socket */
