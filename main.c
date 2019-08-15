@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
+#include <strings.h>
 
 /* threads */
 #include <sched.h>
@@ -303,7 +304,7 @@ void *server_loop(void *ext) {
             switch (args->state) {
 
             case ServerStateIdle: {
-                int len = sizeof(args->cli);
+                socklen_t len = sizeof(args->cli);
                 args->conn_fd = accept(args->sock_fd, (struct sockaddr *) &args->cli, &len);
                 set_blocking_mode(args->conn_fd, 0);
                 if (args->conn_fd > 0) {
@@ -452,7 +453,7 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-file") == 0) {
             rx_looper_args = (RxLooperArgs *) malloc(sizeof(RxLooperArgs));
             bzero(rx_looper_args, sizeof(RxLooperArgs));
-            rx_looper_args->fd = open(argv[++i], O_RDONLY, S_IREAD);
+            rx_looper_args->fd = open(argv[++i], O_RDONLY, S_IRUSR);
             if (rx_looper_args->fd < 0) {
                 printf("unable to open input file\n");
                 return -1;
@@ -475,6 +476,7 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-console") == 0) {
             rx_looper_args = (RxLooperArgs *) malloc(sizeof(RxLooperArgs));
             bzero(rx_looper_args, sizeof(RxLooperArgs));
+            rx_looper_args->tid = &device_rx_thread;
             rx_looper_args->fd = 0;
             rx_looper_args->pool = &rx_pool;
             preamble = &rx_looper_args->preamble;
@@ -483,26 +485,39 @@ int main(int argc, char **argv)
             preamble->thread_run = &thread_run;
             tx_looper_args = (TxLooperArgs *) malloc(sizeof(TxLooperArgs));
             bzero(tx_looper_args, sizeof(TxLooperArgs));
+            tx_looper_args->tid = &device_tx_thread;
             tx_looper_args->fd = 1;
             tx_looper_args->pool = &tx_pool;
             preamble = &tx_looper_args->preamble;
             preamble->run = &run;
             preamble->arm = &arm;
             preamble->thread_run = &thread_run;
-            pthread_create(&device_rx_thread, NULL, rx_looper, rx_looper_args);
-            pthread_create(&device_tx_thread, NULL, tx_looper, tx_looper_args);
+            pthread_create(rx_looper_args->tid, NULL, rx_looper, rx_looper_args);
+            pthread_create(tx_looper_args->tid, NULL, tx_looper, tx_looper_args);
         } else if (strcmp(argv[i], "-uart") == 0) {
             const char *device_name = argv[++i];
             int baud_rate = atoi(argv[++i]);
             rx_looper_args = (RxLooperArgs *) malloc(sizeof(RxLooperArgs));
             bzero(rx_looper_args, sizeof(RxLooperArgs));
+            rx_looper_args->tid = &device_rx_thread;
+            rx_looper_args->pool = &rx_pool;
+            preamble = &rx_looper_args->preamble;
+            preamble->run = &run;
+            preamble->arm = &arm;
+            preamble->thread_run = &thread_run;
             tx_looper_args = (TxLooperArgs *) malloc(sizeof(TxLooperArgs));
             bzero(tx_looper_args, sizeof(TxLooperArgs));
-            rx_looper_args->pool = &rx_pool;
+            tx_looper_args->tid = &device_tx_thread;
             tx_looper_args->pool = &tx_pool;
+            preamble = &tx_looper_args->preamble;
+            preamble->run = &run;
+            preamble->arm = &arm;
+            preamble->thread_run = &thread_run;
             rx_looper_args->fd = tx_looper_args->fd = open_uart(device_name, baud_rate);
-            pthread_create(&device_rx_thread, NULL, rx_looper, rx_looper_args);
-            pthread_create(&device_tx_thread, NULL, tx_looper, tx_looper_args);
+            printf("opened device %d (uart)\n", rx_looper_args->fd);
+            set_blocking_mode(rx_looper_args->fd, 0);
+            pthread_create(rx_looper_args->tid, NULL, rx_looper, rx_looper_args);
+            pthread_create(tx_looper_args->tid, NULL, tx_looper, tx_looper_args);
         } else if (strcmp(argv[i], "-server") == 0) {
             server_args = (ServerArgs *) malloc(sizeof(ServerArgs));
             bzero(server_args, sizeof(ServerArgs));
