@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <strings.h>
+#include <time.h>
 
 /* threads */
 #include <sched.h>
@@ -41,8 +42,20 @@ int set_blocking_mode(int fd, int blocking) {
     return 0;
 }
 
+void print_buffer(const char *msg, uint8_t *p, int n) {
+    printf("%s\n", msg);
+    int k;
+    for (k = 0; k < n; ++k) {
+        printf("%2.2x ", p[k]);
+        if ((k & 7) == 7) { printf("\n"); }
+    }
+}
+
 struct termios old_settings;
-int initialize_n3_serial_port(const char *dev, int baud_rate, int canonical, int parity, int min_chars) {
+int initialize_android_serial_port(const char *dev, int baud_rate, int canonical, int parity, int min_chars) {
+
+    printf("initialize_serial_port (android)\n");
+
     int fd = open(dev, O_RDWR | O_NOCTTY | O_NDELAY | O_NONBLOCK);
     if(fd < 0) { return fd; }
 
@@ -186,7 +199,7 @@ int open_uart(const char *dev_name, int baud_rate) {
     int parity = 0; /* none */
     int min_chars = 8;
     if (n3) {
-        return initialize_n3_serial_port(dev_name, baud_rate, canonical, parity, min_chars);
+        return initialize_android_serial_port(dev_name, baud_rate, canonical, parity, min_chars);
     } else {
         return initialize_serial_port(dev_name, baud_rate, canonical, parity, min_chars);
     }
@@ -262,6 +275,8 @@ void *rx_looper(void *ext) {
     RxLooperArgs *args = (RxLooperArgs *) ext;
     Pool *pool = args->pool;
     LooperArgsPreamble *preamble = &args->preamble;
+    int last_error = 0;
+    time_t now, holdoff_timeout = 0;
     while (*preamble->thread_run) {
         while (*preamble->arm == 0) { usleep(1000); }
         while (*preamble->run) {
@@ -270,22 +285,32 @@ void *rx_looper(void *ext) {
                 uint8_t *ptr = pool->buff[pool->head];
                 ssize_t n_read = read(args->fd, pool->buff[pool->head], pool->buff_size);
                 if (n_read > 0) {
+                    print_buffer("FROM DEVICE:", ptr, n_read);
                     printf("read %ld bytes from device %d\n", n_read, args->fd); /* TODO */
                     pool->length[pool->head] = n_read;
                     if (n_read != pool->buff_size) { pool->buff[pool->head][n_read] = 0; } /* null-terminate */
                     pool->head = new_head;
                     printf("new head = %d. pool = %p\n", pool->head, pool);
-                    if ((n_read > 0) && args->verbose) {
-                        printf("\n");
-                        for (int i = 0; i < n_read; ++i) {
-                            uint8_t byte = ptr[i];
-                            if (args->format == DISPLAY_FORMAT_ASCII) { printf("%c", byte); }
-                            else if (args->format == DISPLAY_FORMAT_HEX) { printf("%2.2x ", byte); }
-                        }
-                        printf("\n");
+//                    if ((n_read > 0) && args->verbose) {
+//                        printf("\n");
+//                        for (int i = 0; i < n_read; ++i) {
+//                            uint8_t byte = ptr[i];
+//                            if (args->format == DISPLAY_FORMAT_ASCII) { printf("%c", byte); }
+//                            else if (args->format == DISPLAY_FORMAT_HEX) { printf("%2.2x ", byte); }
+//                        }
+//                        printf("\n");
+//                    }
+                } else if (n_read == -1) {
+                    now = time(0);
+                    int holdoff_ok = (holdoff_timeout == 0) || (now > holdoff_timeout);
+                    if (errno != last_error) {
+                        last_error = errno;
                     }
-                } else if (n_read < 0) {
-                    printf("error reading from %d\n", args->fd);
+                    if (holdoff_ok) {
+                        perror("input device read error");
+                        printf("error reading from %d\n", args->fd);
+                        holdoff_timeout = now + 1; /* once a second max */
+                    }
                 }
             }
             usleep(1000);
@@ -320,24 +345,21 @@ void *server_loop(void *ext) {
             }
 
             case ServerStateConnected: {
-                /* from socket to device */
+                /* from socket to device. socket produces into head; device consumes from tail */
                 Pool *pool = args->tx_pool;
                 uint8_t *ptr = pool->buff[pool->head];
                 int n_bytes = read(args->conn_fd, pool->buff[pool->head], pool->buff_size);
                 if (n_bytes > 0) {
                     pool->length[pool->head] = n_bytes;
                     pool->head = (pool->head + 1) & pool->mask;
-                    printf("FOR DEVICE:\n");
-                    int k;
-                    for (k = 0; k < n_bytes; ++k) {
-                        printf("%2.2x ", ptr[k]);
-                    }
+                    print_buffer("TO DEVICE:", ptr, n_bytes);
                 }
 
-                /* from device to socket */
+                /* from device to socket. device produces into head; socket consumes from tail. */
                 pool = args->rx_pool;
                 if (pool->head != pool->tail) {
                     int remaining = pool->length[pool->tail];
+                    print_buffer("FROM DEVICE", ptr, remaining);
                     while (remaining) {
                         n_bytes = write(args->conn_fd, pool->buff[pool->tail], remaining);
                         remaining = remaining - n_bytes;
@@ -380,31 +402,29 @@ void *client_loop(void *ext) {
     while (*preamble->thread_run) {
         while (*preamble->arm == 0) { usleep(1000); }
         while (*preamble->run) {
-            /* from socket to device */
+            /* from socket to device. socket produces into head; device consumes from tail */
             Pool *pool = args->tx_pool;
             uint8_t *ptr = pool->buff[pool->head];
             int n_bytes = read(args->sock_fd, pool->buff[pool->head], pool->buff_size);
             if (n_bytes > 0) {
                 pool->length[pool->head] = n_bytes;
                 pool->head = (pool->head + 1) & pool->mask;
-                printf("FOR DEVICE:\n");
-                int k;
-                for (k = 0; k < n_bytes; ++k) {
-                    printf("%2.2x ", ptr[k]);
-                }
+                print_buffer("TO DEVICE:", ptr, n_bytes);
             }
 
-            /* from device to socket */
+            /* from device to socket. device produces into head; socket consumes from tail. */
             pool = args->rx_pool;
             if (pool->head != pool->tail) {
                 int remaining = pool->length[pool->tail];
-                printf("received %d bytes for writing to %d\n", remaining, args->sock_fd);
+                uint8_t *ptr = pool->buff[pool->tail];
+                print_buffer("FROM DEVICE", ptr, remaining);
+                // printf("received %d bytes for writing to %d\n", remaining, args->sock_fd);
                 while (remaining) {
                     n_bytes = write(args->sock_fd, pool->buff[pool->tail], remaining);
                     remaining = remaining - n_bytes;
                 }
                 pool->tail = (pool->tail + 1) & pool->mask;
-                printf("head = %d. tail = %d. mask = %d\n", pool->head, pool->tail, pool->mask);
+                // printf("head = %d. tail = %d. mask = %d\n", pool->head, pool->tail, pool->mask);
             }
             usleep(1000);
         }
@@ -509,6 +529,7 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-uart") == 0) {
             const char *device_name = argv[++i];
             int baud_rate = atoi(argv[++i]);
+
             rx_looper_args = (RxLooperArgs *) malloc(sizeof(RxLooperArgs));
             bzero(rx_looper_args, sizeof(RxLooperArgs));
             rx_looper_args->tid = &device_rx_thread;
@@ -517,6 +538,7 @@ int main(int argc, char **argv)
             preamble->run = &run;
             preamble->arm = &arm;
             preamble->thread_run = &thread_run;
+
             tx_looper_args = (TxLooperArgs *) malloc(sizeof(TxLooperArgs));
             bzero(tx_looper_args, sizeof(TxLooperArgs));
             tx_looper_args->tid = &device_tx_thread;
@@ -525,6 +547,7 @@ int main(int argc, char **argv)
             preamble->run = &run;
             preamble->arm = &arm;
             preamble->thread_run = &thread_run;
+
             rx_looper_args->fd = tx_looper_args->fd = open_uart(device_name, baud_rate);
             printf("opened device %d (uart)\n", rx_looper_args->fd);
             set_blocking_mode(rx_looper_args->fd, 0);
