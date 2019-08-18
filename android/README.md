@@ -28,5 +28,5 @@ If successful, perform the following steps to load utility onto device
 
 Once in ADB shell
 
-    PipeFitter -uart /dev/ttyHS2 115200 -server 8086
+    PipeFitter -n3 -uart /dev/ttyHS2 115200 -server 8086
 
