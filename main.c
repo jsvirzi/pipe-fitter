@@ -34,6 +34,15 @@
 
 int debug = 0, verbose = 0, n3 = 0;
 
+uint32_t get_time(uint32_t *time) { /* milliseconds */
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    uint64_t t = now.tv_sec * 1000L;
+    t = t + (now.tv_nsec / 1000000L);
+    if (time) { *time = t; }
+    return (uint32_t) t;
+}
+
 int set_blocking_mode(int fd, int blocking) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (blocking) { flags &= ~O_NONBLOCK; }
@@ -43,6 +52,16 @@ int set_blocking_mode(int fd, int blocking) {
 }
 
 void print_buffer(const char *msg, uint8_t *p, int n) {
+    return;
+    printf("%s\n", msg);
+    int k;
+    for (k = 0; k < n; ++k) {
+        printf("(%c)=%2.2x ", p[k], p[k]);
+        if ((k & 7) == 7) { printf("\n"); }
+    }
+}
+
+void TODO_buffer(const char *msg, uint8_t *p, int n) {
     printf("%s\n", msg);
     int k;
     for (k = 0; k < n; ++k) {
@@ -188,12 +207,6 @@ void initialize_pool(Pool *pool, int buffs, int buff_size) {
     pool->buff_size = buff_size;
 }
 
-void initialize_queue(Queue *queue, int length) {
-    bzero(queue, sizeof(Queue));
-    queue->buff = (uint8_t *) malloc(length);
-    queue->mask = length - 1;
-}
-
 int open_uart(const char *dev_name, int baud_rate) {
     int canonical = 0;
     int parity = 0; /* none */
@@ -216,6 +229,8 @@ typedef struct ServerArgs {
     Pool *tx_pool;
     struct sockaddr_in cli;
     struct sockaddr_in servaddr;
+    uint64_t conn_timeout;
+    uint64_t conn_period;
 } ServerArgs;
 
 enum {
@@ -236,20 +251,30 @@ void *tx_looper(void *ext) {
     TxLooperArgs *args = (TxLooperArgs *) ext;
     LooperArgsPreamble *preamble = &args->preamble;
     Pool *pool = args->pool;
+    time_t now = time(0);
+    int period = 4;
+    time_t timeout = now + period;
     while (*preamble->thread_run) {
         while (*preamble->arm == 0) { usleep(1000); }
         while (*preamble->run) {
+            usleep(1000); /* thread pacer */
+            now = time(0);
+            if (now > timeout) {
+                printf("tx thread says hello. H=%d T=%d\n", pool->head, pool->tail);
+                timeout = now + period;
+            }
             while (pool->head != pool->tail) {
-                if (pool->length[pool->tail] && args->fd) {
+                unsigned int length = pool->length[pool->tail];
+                printf("data ready FOR DEVICE: H=%d T=%d L=%d\n", pool->head, pool->tail, length);
+                if (length && args->fd) {
                     int remaining = pool->length[pool->tail];
                     while (remaining > 0) {
                         int n_bytes = write(args->fd, pool->buff[pool->tail], remaining);
+                        printf("sent %d bytes to fd=%d\n", n_bytes, args->fd);
                         remaining = remaining - n_bytes;
                     }
                     pool->length[pool->tail] = 0; /* clear once done */
                     pool->tail = (pool->tail + 1) & pool->mask;
-                } else {
-                    usleep(1000); /* micronap */
                 }
             }
         }
@@ -286,11 +311,11 @@ void *rx_looper(void *ext) {
                 ssize_t n_read = read(args->fd, pool->buff[pool->head], pool->buff_size);
                 if (n_read > 0) {
                     print_buffer("FROM DEVICE:", ptr, n_read);
-                    printf("read %ld bytes from device %d\n", n_read, args->fd); /* TODO */
+                    // printf("read %ld bytes from device %d\n", n_read, args->fd); /* TODO TODO */
                     pool->length[pool->head] = n_read;
                     if (n_read != pool->buff_size) { pool->buff[pool->head][n_read] = 0; } /* null-terminate */
                     pool->head = new_head;
-                    printf("new head = %d. pool = %p\n", pool->head, pool);
+//                    printf("new head = %d. pool = %p\n", pool->head, pool);
 //                    if ((n_read > 0) && args->verbose) {
 //                        printf("\n");
 //                        for (int i = 0; i < n_read; ++i) {
@@ -323,9 +348,19 @@ void *server_loop(void *ext) {
     ServerArgs *args = (ServerArgs *) ext;
     LooperArgsPreamble *preamble = &args->preamble;
     args->state = ServerStateIdle;
+    uint32_t now;
     while (*preamble->thread_run) {
         while (*preamble->arm == 0) { usleep(1000); }
         while (*preamble->run) {
+            get_time(&now);
+
+            if (args->conn_timeout && (now > args->conn_timeout)) {
+                close(args->conn_fd);
+                printf("connection %d closed due to lack of activity\n", args->conn_fd);
+                args->conn_timeout = 0;
+                args->conn_fd = 0;
+                args->state = ServerStateIdle;
+            }
             switch (args->state) {
 
             case ServerStateIdle: {
@@ -335,6 +370,7 @@ void *server_loop(void *ext) {
                 if (args->conn_fd > 0) {
                     printf("accepted connection on port %d. connection = %d\n", args->port, args->conn_fd);
                     args->state = ServerStateConnected;
+                    args->conn_timeout = (args->conn_period) ? args->conn_timeout = get_time(0) + args->conn_period : 0;
                 } else if (args->conn_fd < 0) {
                     if (errno != EAGAIN) {
                         printf("connection %d rejected incoming request on port %d. reason = %d\n", args->sock_fd,
@@ -349,10 +385,13 @@ void *server_loop(void *ext) {
                 Pool *pool = args->tx_pool;
                 uint8_t *ptr = pool->buff[pool->head];
                 int n_bytes = read(args->conn_fd, pool->buff[pool->head], pool->buff_size);
+                // printf("boogada %d from conn %d\n", n_bytes, args->conn_fd);
                 if (n_bytes > 0) {
+                    printf("BOOGADA %d\n", n_bytes);
+                    if (args->conn_timeout) { args->conn_timeout = get_time(0) + args->conn_period; } /* reset timeout */
                     pool->length[pool->head] = n_bytes;
                     pool->head = (pool->head + 1) & pool->mask;
-                    print_buffer("TO DEVICE:", ptr, n_bytes);
+                    TODO_buffer("TO DEVICE:", ptr, n_bytes);
                 }
 
                 /* from device to socket. device produces into head; socket consumes from tail. */
