@@ -270,6 +270,7 @@ void *tx_looper(void *ext) {
                     int remaining = pool->length[pool->tail];
                     while (remaining > 0) {
                         int n_bytes = write(args->fd, pool->buff[pool->tail], remaining);
+                        tcdrain(args->fd);
                         printf("sent %d bytes to fd=%d\n", n_bytes, args->fd);
                         remaining = remaining - n_bytes;
                     }
